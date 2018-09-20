@@ -1,0 +1,1277 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using telent.Mica.Horizon.config;
+using telent.Mica.Horizon;
+using System.Threading;
+using log4net;
+using OpcClient;
+
+namespace telent.Mica.Horizon
+{
+
+    class ServerMicrophone : ServerAsset
+    {
+        #region enum
+        public enum RouteState { clearOrClearing, pending, established }
+        #endregion
+
+        #region fields
+        /// <summary>
+        /// The timer used to monitor the progress of a route set request.
+        /// </summary>
+        private Timer routeSettingTimer = null;
+
+        /// <summary>
+        /// Check the status of a route being established every 500ms.
+        /// </summary>
+        private const int routeSettingCheckTimeout = 500;
+
+        /// <summary>
+        /// The remaining time to allow for a route set request to complete.
+        /// A counter decremented each time the routeSettingCheckTimeout expires.
+        /// </summary>
+        private uint remainingRouteSettingTime = 0;
+
+        #region PA router zones (ServerPaZone instances)
+        /// <summary>
+        /// The ServerPaZone instances associated with the zones that have been requested in a route set request.
+        /// </summary>
+        private List<ServerPaZone> requestedZones = new List<ServerPaZone>();
+
+        /// <summary>
+        /// The logical outputs associated with the zones that have been requested in a route set request.
+        /// </summary>
+        private List<string> requestedLogicalOutputs = new List<string>();
+
+        /// <summary>
+        /// The logical outputs currently granted in a route set request.
+        /// </summary>
+        private List<string> grantedLogicalOutputs = new List<string>();
+
+        /// <summary>
+        /// The zones associated with the logical outputs.
+        /// </summary>
+        private Dictionary<string, ServerPaZone> requestedLogicalOutputsToZones = new Dictionary<string, ServerPaZone>();
+        #endregion
+
+        #region contact driven zones (ServerPaSwitchedZone instances)
+        /// <summary>
+        /// The ServerPaSwitchedZone instances associated with the zones that have been requested in a route set request.
+        /// </summary>
+        private List<ServerPaSwitchedZone> requestedSwitchedZones = new List<ServerPaSwitchedZone>();
+
+        /// <summary>
+        /// The ServerPaSwitchedZone instances to which a route has been established.
+        /// </summary>
+        private List<ServerPaSwitchedZone> grantedSwitchedZones = new List<ServerPaSwitchedZone>();
+        #endregion
+
+        /// <summary>
+        /// Established when all of the requested logical outputs or (when partial grant is allowed) as
+        /// many logical outputs as possible have been granted within the route setting time.  Pending
+        /// while attempting to get all requested zones otherwise clearedOrClearing.
+        /// </summary>
+        private RouteState routeState = RouteState.clearOrClearing;
+
+        /// <summary>
+        /// Share the route setting parameters between threads.
+        /// </summary>
+        private object routeLock = new object();
+
+        /// <summary>
+        /// An RTU output that is set to record announcements from the microphone.
+        /// </summary>
+        private ServerRtuOutput linkedRecordingOutput = null;
+        #endregion
+
+        #region config
+        private static readonly ILog logger = LogManager.GetLogger(typeof(ServerMicrophone));
+        /// <summary>
+        /// Return a typed version of the config 
+        /// </summary>
+        public microphone microphoneConfig { get { return (microphone)Config; } }
+
+        private ServerLogicalInputPort logicalInputPort;
+        private string workstationGuiName = "";
+        private int priority;
+        private string chimeType="0";
+        private bool micChimes = false;
+
+        public ServerMicrophone(microphone mic)
+        {
+            Config = mic;
+            priority = mic.Priority;
+            chimeType = mic.ChimeTime.ToString();
+            micChimes = mic.ChimeTime > 0;
+            driverType = OpcDriverConfig.eDriverType.Unknown;
+        } 
+        #endregion
+
+        #region linking
+        /// <summary>
+        /// Links the asset to a related asset
+        /// </summary>
+        /// <param name="otherAsset">The asset to link to</param>
+        public override void setLink(ServerAsset otherAsset, string linkName)
+        {
+            base.setLink(otherAsset);
+            //when associated with a Logical Input Port.
+            if (otherAsset is ServerLogicalInputPort)
+            {
+                logicalInputPort = (ServerLogicalInputPort)otherAsset;
+                driverType = logicalInputPort.driverType;
+            }
+            if (otherAsset is ServerWorkstation)
+            {
+                workstationGuiName = otherAsset.GuiName;
+            }
+            if (otherAsset is ServerRtuOutput)
+            {
+                linkedRecordingOutput = otherAsset as ServerRtuOutput;
+            }
+        }
+
+
+        public override void setLink(ServerAsset otherAsset)
+        {
+            setLink(otherAsset, "");
+        }
+        #endregion
+
+        #region link to Logical Input Port
+        /// <summary>
+        /// True when the links to the logical input port have been restablished
+        /// </summary>
+        private bool linked = false;
+
+        /// <summary>
+        /// Links the microphone to its associated Logical Input Port.
+        /// The Microphone subscribes to OPC events at the port so as
+        /// to provide a summary to the workstation
+        /// </summary>
+        public void LinkToLogicalInputPort()
+        {
+            if (!linked
+                && logicalInputPort != null)
+            {
+                //Add Microphone Event Handlers for Associated Port's OPC Items
+                logicalInputPort.microphoneBusy.ValueChanged += new EventHandler(microphoneBusyValueChanged);
+                logicalInputPort.routeExists.ValueChanged += new EventHandler(routeExistsValueChanged);
+                logicalInputPort.target.ValueChanged += new EventHandler(targetValueChanged);
+                linked = true;
+            }
+        } 
+        #endregion
+
+        #region initialisation
+        /// <summary>
+        /// Initialisation after all OPC is ready
+        /// </summary>
+        /// <returns>true if successful.</returns>
+        public override bool InitialiseAsset()
+        {
+            base.InitialiseAsset();
+
+            LinkToLogicalInputPort();
+
+            return true;
+        }
+        #endregion
+
+        #region notify all
+        /// <summary>
+        /// Notify all property values to all queues
+        /// </summary>
+        public override void NotifyAllProperties()
+        {
+            base.NotifyAllProperties();
+            if (logicalInputPort != null)
+            {
+                NotifyPropertyValue("PushToTalkPressed", logicalInputPort.MicrophoneBusy);
+                NotifyPropertyValue("RouteZones", logicalInputPort.Route);
+            }
+            NotifyPropertyValue("Status", status.ToString());
+            NotifyPropertyValue("RequestedZonesList", RequestedZonesList);
+        }
+
+        public override void AddCurrentPropertyValues(List<AssetPropertyValue> propertyList)
+        {
+            if (logicalInputPort != null)
+            {
+                propertyList.Add(new AssetPropertyValue(Config.AssetName, "PushToTalkPressed", logicalInputPort.MicrophoneBusy));
+                propertyList.Add(new AssetPropertyValue(Config.AssetName, "RouteZones", logicalInputPort.Route));
+            }
+            propertyList.Add(new AssetPropertyValue(Config.AssetName, "Status", status.ToString()));
+        }
+
+        #endregion
+
+        #region route zones
+        /// <summary>
+        /// Initialise the parameters that are used to determine that a requested route has been 
+        /// established.
+        /// </summary>
+        private void initialiseRouteSettingParameters()
+        {
+            stopRouteSettingTimer();
+            routeState = RouteState.clearOrClearing;
+
+            // Set the counter used to determine when the route setting time has expired.  Multiply by 2 as the
+            // count is in seconds but the routeSettingCheckTimeout occurs every 500ms.
+            remainingRouteSettingTime = MicaHorizonServer.Instance.SystemSettings.RouteSettingTimeSecs * 2;
+        }
+
+        /// <summary>
+        /// Clear the zone lists for audio router PA zones.
+        /// </summary>
+        private void clearRequestedAndGrantedZoneLists()
+        {
+            requestedZones.Clear();
+            requestedLogicalOutputs.Clear();
+            grantedLogicalOutputs.Clear();
+        }
+
+        /// <summary>
+        /// Clear the zone lists for contact driven PA zones.
+        /// </summary>
+        private void clearRequestedAndGrantedSwitchedPaZoneLists()
+        {
+            foreach (ServerPaSwitchedZone requestedZone in requestedSwitchedZones)
+            {
+                requestedZone.PropertyChanged -= switchedZone_PropertyChanged;
+            }
+            requestedSwitchedZones.Clear();
+            grantedSwitchedZones.Clear();
+        }
+
+        /// <summary>
+        /// Set the lists of zones and associated logical outputs that have been requested.
+        /// </summary>
+        /// <param name="serverPaZone"></param>
+        private void setRequestedZones(ServerPaZone serverPaZone)
+        {
+            if (serverPaZone != null
+                && !string.IsNullOrEmpty(serverPaZone.LogicalOutputPorts))
+            {
+                if (!requestedZones.Contains(serverPaZone))
+                {
+                    requestedZones.Add(serverPaZone);
+                }
+
+                string[] logicalOutputs = serverPaZone.LogicalOutputPorts.Split('|');
+
+                if (logicalOutputs.Length > 0)
+                {
+                    for (int i = 0; i < logicalOutputs.Length; i++)
+                    {
+                        if (!requestedLogicalOutputsToZones.ContainsKey(logicalOutputs[i]))
+                        {
+                            requestedLogicalOutputsToZones.Add(logicalOutputs[i], serverPaZone);
+                        }
+
+                        if (!requestedLogicalOutputs.Contains(logicalOutputs[i]))
+                        {
+                            requestedLogicalOutputs.Add(logicalOutputs[i]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Set the lists of contact driven zones that have been requested.
+        /// </summary>
+        /// <param name="serverPaSwitchedZone"></param>
+        private void setRequestedSwitchedZones(ServerPaSwitchedZone serverPaSwitchedZone)
+        {
+            if (serverPaSwitchedZone != null
+                && serverPaSwitchedZone.LinkedSelectZoneOutput != null)
+            {
+                if (!requestedSwitchedZones.Contains(serverPaSwitchedZone))
+                {
+                    requestedSwitchedZones.Add(serverPaSwitchedZone);
+                }
+            }
+        }
+
+        string lastZoneStr;
+        /// <summary>
+        /// Creates a list of Logical Output Ports from a given set of PA Zones,
+        /// prepends the routing parameters, and sets the route on the
+        /// associated logical input port
+        /// </summary>
+        /// <param name="zones"></param>
+        public void routeZones(List<string> zones)
+        {
+            string route = "";
+            string routeHeader = "";
+            string zoneStr = "";
+
+            lock (routeLock)
+            {
+                initialiseRouteSettingParameters();
+
+                if (zones.Count == 0)
+                {
+                    // Clear an established route.
+                    clearRoute();
+                    return;
+                }
+
+                bool playZoneChimes = micChimes;
+                string chimes = chimeType;
+
+                // Start recording the microphone.
+                if (linkedRecordingOutput != null)
+                {
+                    linkedRecordingOutput.Value = true;
+                }
+
+                // Ensure the list of requested and granted zones/logical outputs is clear before starting a new
+                // route request.
+                clearRequestedAndGrantedZoneLists();
+                clearRequestedAndGrantedSwitchedPaZoneLists();
+                RequestedZonesList = "";
+
+
+                //If Mic not set to play chimes, check if any zones are
+                //Add each Paz's ports to route
+                foreach (string ass in zones)
+                {
+                    ServerAsset asset = MicaHorizonServer.Instance.FindServerAsset(ass);
+                    if (asset is ServerPaZone)
+                    {
+                        ServerPaZone paz = (ServerPaZone)asset;
+                        setRequestedZones(paz);
+                        route = route + "|" + paz.LogicalOutputPorts;
+                        playZoneChimes = playZoneChimes || paz.Chimes;
+                        if (paz.Chimes)
+                        {
+                            playZoneChimes = true;
+                        }
+                        if (zoneStr != "")
+                        {
+                            zoneStr += ", ";
+                        }
+                        zoneStr += paz.GuiName;
+                    }
+
+                    if (asset is ServerPaSwitchedZone)
+                    {
+                        ServerPaSwitchedZone paz = (ServerPaSwitchedZone)asset;
+                        setRequestedSwitchedZones(paz);
+                    }
+                }
+                reportRequestedZones();
+
+                // If the request includes PA router zones then set up the header for the request.
+                if (requestedLogicalOutputs.Count > 0)
+                {
+                    int numChimes = 0;
+
+                    if (!int.TryParse(chimeType, out numChimes))
+                    {
+                        logger.Error("Invalid chime configuration: " + chimeType + " for " + this.GuiName);
+                    }
+
+                    if (numChimes == 0
+                        && playZoneChimes)
+                    {
+                        // the mic is not configured for chimes but the zone is so we will assume that
+                        // 3 chimes are required
+                        numChimes = 3;
+                    }
+
+                    routeHeader = priority.ToString() + "|" + numChimes.ToString() +
+                        (MicaHorizonServer.Instance.SystemSettings.AllowPartialGrant ? "|1|" : "|0|") +
+                        "0";
+                }
+
+                lastZoneStr = zoneStr;
+
+                // We are requesting a route - start the timer for setting the route.
+                startRouteSettingTimer();
+
+                // Set a route to the contact driven zones.
+                if (requestedSwitchedZones.Count > 0)
+                {
+                    routeState = RouteState.pending;
+                    foreach (ServerPaSwitchedZone switchedZone in requestedSwitchedZones)
+                    {
+                        switchedZone.PropertyChanged += switchedZone_PropertyChanged;
+                        switchedZone.SelectZone();
+                    }
+                }
+
+                // Set a route to the audio router zones.
+                if (requestedLogicalOutputs.Count > 0)
+                {
+                    routeState = RouteState.pending;
+                    logicalInputPort.Route = routeHeader + route;
+                }
+            }
+        }
+        #endregion
+
+        #region clear route
+        /// <summary>
+        /// Clear the route to granted zones.
+        /// </summary>
+        private void clearRoute()
+        {
+            bool routeToClear = false;
+
+            routeState = RouteState.clearOrClearing;
+            // Stop the route setting timer if it is running.
+            stopRouteSettingTimer();
+
+            // Stop recording the microphone.
+            if (linkedRecordingOutput != null)
+            {
+                linkedRecordingOutput.Value = false;
+            }
+
+            // Report the granted/missed zones.
+            reportRoutePlayedToZones();
+            RequestedZonesList = "";
+
+            // If there are no granted zones we can simply update the microphone status.
+            if (grantedLogicalOutputs.Count == 0
+                && grantedSwitchedZones.Count == 0)
+            {
+                updateMicrophoneStatus(true);
+            }
+
+            // Clear contact driven routes - the ones that have been selected but are not necessarily granted.
+            if (requestedSwitchedZones.Count > 0)
+            {
+                routeToClear = true;
+                foreach (ServerPaSwitchedZone requestedSwitchedZone in requestedSwitchedZones)
+                {
+                    if (requestedSwitchedZone.ZoneSelected)
+                    {
+                        requestedSwitchedZone.DeselectZone();
+                    }
+                }
+            }
+
+            // Clear audio router zones.
+            if (requestedLogicalOutputs.Count > 0)
+            {
+                routeToClear = true;
+                logicalInputPort.Route = "";
+            }
+
+            if (!routeToClear
+                && workstationGuiName != "")
+            {
+                MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Operator, "Route cleared without route granted", lastZoneStr, workstationGuiName, "", "");
+                updateMicrophoneStatus();
+            }
+        }
+        #endregion
+
+        #region mic status
+        private Constants.micStatus status = Constants.micStatus.idle;
+        /// <summary>
+        /// Update the status that is used to set the state of the PA live microphone button on the GUI.
+        /// </summary>
+        /// <param name="routeCleared">True if a route for which there were granted zones no longer
+        /// has granted zones.</param>
+        private void updateMicrophoneStatus(bool routeCleared = false)
+        {
+            Constants.micStatus newMicStatus = status;
+
+            if (routeCleared)
+            {
+                if (routeState != RouteState.pending
+                    || remainingRouteSettingTime == 0)
+                {
+                    newMicStatus = Constants.micStatus.idle;
+                }
+            }
+            else if (requestedSwitchedZones.Count > 0)
+            {
+                // First check any contact driven zones.
+                if (routeState == RouteState.pending)
+                {
+                    // The route has been set up but not necessarily yet granted to all requested zones. 
+                    newMicStatus = Constants.micStatus.pending;
+                }
+                else if (routeState == RouteState.established)
+                {
+                    newMicStatus = microphoneBusy ? Constants.micStatus.talking : Constants.micStatus.ready;
+                }
+            }
+            else
+            {
+                switch (RouteExists)
+                {
+                    default:
+                        // Not a valid value - assume failed.
+                        newMicStatus = Constants.micStatus.failed;
+                        break;
+                    case 0:
+                        newMicStatus = Constants.micStatus.idle;
+                        break;
+                    case 1:
+                    case 2:
+                        newMicStatus = Constants.micStatus.pending;
+                        break;
+                    case 3:
+                        if (routeState == RouteState.pending)
+                        {
+                            // The route has been set up but not necessarily yet granted to all requested zones. 
+                            newMicStatus = Constants.micStatus.pending;
+                        }
+                        else
+                        {
+                            newMicStatus = microphoneBusy ? Constants.micStatus.talking : Constants.micStatus.ready;
+                        }
+                        break;
+                    case 4:
+                        newMicStatus = Constants.micStatus.failed;
+                        break;
+                    case 5:
+                        newMicStatus = Constants.micStatus.blocked;
+                        break;
+                }
+            }
+
+            logger.Debug("New status = " + newMicStatus.ToString());
+            if (status != newMicStatus)
+            {
+                logger.Debug("Notifying new status = " + newMicStatus.ToString());
+                status = newMicStatus;
+                NotifyPropertyValue("Status", status.ToString());
+            }
+        }
+
+        void statusNotifyTimerExpires(object obj)
+        {
+            NotifyPropertyValue("Status", status.ToString());
+        }
+
+        #endregion
+
+        #region microphone busy
+        public void microphoneBusyValueChanged(object sender, EventArgs e)
+        {
+            lock (routeLock)
+            {
+                if (logicalInputPort != null
+                    && logicalInputPort.microphoneBusy != null
+                    && logicalInputPort.microphoneBusy.Quality == OpcItem.OpcQualityGood)
+                {
+                    microphoneBusy = logicalInputPort.microphoneBusy.ItemValue;
+                    NotifyPropertyValue("PushToTalkPressed", microphoneBusy);
+                    updateMicrophoneStatus();
+                }
+            }
+        }
+
+        private bool microphoneBusy = false;
+        #endregion
+
+        #region routeExists
+        /// <summary>
+        /// RouteExists OPC item for the linked logical input port has changed.
+        /// </summary>
+        void routeExistsValueChanged(object sender, EventArgs e)
+        {
+            lock (routeLock)
+            {
+                if (logicalInputPort != null
+                    && logicalInputPort.routeExists != null
+                    && logicalInputPort.routeExists.Quality == OpcItem.OpcQualityGood)
+                {
+                    RouteExists = logicalInputPort.routeExists.ItemValue;
+                    logger.Debug("Route exists value changed to " + RouteExists.ToString());
+                    updateMicrophoneStatus();
+                }
+            }
+        }
+
+        /// <summary>
+        /// The value reporting the state of the route being established.
+        /// </summary>
+        public int RouteExists { get; private set; }
+        #endregion
+
+        #region target
+        /// <summary>
+        /// The Target OPC item for the linked logical input port has changed.  The
+        /// Target is a , separated list of logical outputss to which a route is established.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        public void targetValueChanged(object sender, EventArgs e)
+        {
+            lock (routeLock)
+            {
+                if (logicalInputPort != null
+                    && logicalInputPort.target != null
+                    && logicalInputPort.target.Quality == OpcItem.OpcQualityGood)
+                {
+                    Target = logicalInputPort.target.ItemValue;
+                    logger.Debug("Target value changed to " + Target);
+
+                    if (string.IsNullOrEmpty(Target)
+                        && grantedLogicalOutputs.Count > 0)
+                    {
+                        // The target has cleared - report the played information and clear the zone 
+                        // details if the route is cleared entirely.
+                        grantedLogicalOutputs.Clear();
+                        updateGrantedStatus();
+                        updateMicrophoneStatus(grantedSwitchedZones.Count == 0);
+                        return;
+                    }
+
+                    // Refresh the granted logical outputs with the values in the new target.
+                    grantedLogicalOutputs.Clear();
+
+                    if (!string.IsNullOrEmpty(Target))
+                    {
+                        grantedLogicalOutputs = Target.Split('|').ToList<string>();
+                        updateGrantedStatus();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// The value of the logical input port Target.
+        /// </summary>
+        public string Target { get; private set; }
+
+        /// <summary>
+        /// Sets a zone's RouteEstablished property to true when a requested zone is in our list of
+        /// targets and false if not.
+        /// </summary>
+        private void updateGrantedStatus()
+        {
+            if (grantedLogicalOutputs.Count == 0)
+            {
+                // We have no routes established to requested zones.
+                foreach (ServerPaZone requestedZone in requestedZones)
+                {
+                    if (requestedZone != null)
+                    {
+                        requestedZone.RouteEstablished = false;
+                    }
+                }
+                return;
+            }
+
+            List<ServerPaZone> grantedZones = new List<ServerPaZone>();
+            List<ServerPaZone> notGrantedZones = new List<ServerPaZone>();
+
+            foreach (string requestedLogicalOutput in requestedLogicalOutputs)
+            {
+                ServerPaZone requestedZone = null;
+
+                // Create lists of the currently granted or not granted zones.
+                if (requestedLogicalOutputsToZones.TryGetValue(requestedLogicalOutput, out requestedZone)
+                    && requestedZone != null)
+                {
+                    if (grantedLogicalOutputs.Contains(requestedLogicalOutput))
+                    {
+                        if (!notGrantedZones.Contains(requestedZone)
+                            && !grantedZones.Contains(requestedZone))
+                        {
+                            grantedZones.Add(requestedZone);
+                        }
+                    }
+                    else
+                    {
+                        if (grantedZones.Contains(requestedZone))
+                        {
+                            grantedZones.Remove(requestedZone);
+                        }
+                        if (!notGrantedZones.Contains(requestedZone))
+                        {
+                            notGrantedZones.Add(requestedZone);
+                        }
+                    }
+                }
+
+                // Set RouteEstablished to true for any granted zones.
+                foreach (ServerPaZone grantedZone in grantedZones)
+                {
+                    grantedZone.RouteEstablished = true;
+                }
+
+                // False for not granted zones.
+                foreach (ServerPaZone notGrantedZone in notGrantedZones)
+                {
+                    notGrantedZone.RouteEstablished = false;
+                }
+            }
+        }
+        #endregion
+
+        #region route setting progress
+        /// <summary>
+        /// Start the timer used to check on the progress of a set route request.
+        /// Check every 500 milliseconds.
+        /// </summary>
+        private void startRouteSettingTimer()
+        {
+            stopRouteSettingTimer();
+            routeSettingTimer = new Timer(new TimerCallback(routeSettingTimerCallback),
+                    null, 500,
+                    System.Threading.Timeout.Infinite);
+        }
+
+        /// <summary>
+        /// Stop the timer used to check on the progress of a set route request.
+        /// </summary>
+        /// <returns></returns>
+        private void stopRouteSettingTimer()
+        {
+            if (routeSettingTimer != null)
+            {
+                routeSettingTimer.Dispose();
+                routeSettingTimer = null;
+            }
+        }
+
+        /// <summary>
+        /// The route setting timer has expired.
+        /// If the total route setting time has elapsed and the route has not been set then clear it.
+        /// If there is time remaining to set up the route and not all logical output have been granted then
+        /// re-start the timer to allow the route set to continue.
+        /// If the route has been set to all requested logical outputs, or the total route setting time has elapsed
+        /// with not all logical outputs granted but we are allowing partial grant then the request has been successful.
+        /// </summary>
+        /// <param name="state"></param>
+        private void routeSettingTimerCallback(object state)
+        {
+            bool success = true;
+
+            lock (routeLock)
+            {
+                stopRouteSettingTimer();
+
+                if (remainingRouteSettingTime > 0)
+                {
+                    remainingRouteSettingTime -= 1;
+                }
+                else
+                {
+                    remainingRouteSettingTime = 0;
+                }
+
+                if (remainingRouteSettingTime == 0)
+                {
+                    // We have run out of time to set up the route.
+                    bool logicalOutputsRouteSet = routeSettingTimeExpiredRouteSet();
+                    bool switchedZonesRouteSet = routeSettingTimeExpiredSwitchedZoneRouteSet();
+
+                    // Clear the route if none of the requested zones have been granted.
+                    if (!logicalOutputsRouteSet
+                        && !switchedZonesRouteSet)
+                    {
+                        clearRoute();
+                        success = false;
+                    }
+                    else if (!MicaHorizonServer.Instance.SystemSettings.AllowPartialGrant)
+                    {
+                        // Clear the route if not all requested zones have been granted and
+                        // we are not allowing partial grant.
+                        if ((requestedLogicalOutputs.Count > 0 && !logicalOutputsRouteSet)
+                            || (requestedSwitchedZones.Count > 0 && !switchedZonesRouteSet))
+                        {
+                            clearRoute();
+                            success = false;
+                        }
+                    }
+                }
+                else
+                {
+                    bool logicalOutputsRouteSet = routeSettingTimeAvailableRouteSet();
+                    bool switchedZonesRouteSet = routeSettingTimeAvailableSwitchedZoneRouteSet();
+
+                    if ((requestedLogicalOutputs.Count == 0 && !switchedZonesRouteSet)
+                        || (requestedSwitchedZones.Count == 0 && !logicalOutputsRouteSet)
+                        || (requestedLogicalOutputs.Count > 0 && !logicalOutputsRouteSet)
+                        || (requestedSwitchedZones.Count > 0 && !switchedZonesRouteSet))
+                    {
+                        // Restart the timer to allow more time for the route to establish.
+                        updateMicrophoneStatus();
+                        startRouteSettingTimer();
+                        success = false;
+                    }
+                }
+
+                if (success)
+                {
+                    routeState = RouteState.established;
+                    updateMicrophoneStatus();
+                }
+            }
+        }
+
+        #region PA router zones
+        /// <summary>
+        /// The total route setting time has elapsed.
+        /// </summary>
+        /// <returns>True if all, or some logical outputs with partial grant allowed, are granted.
+        /// Also validate that any granted logical outputs are ones that were requested.
+        /// False if not or if no logical outputs requested.</returns>
+        private bool routeSettingTimeExpiredRouteSet()
+        {
+            if (requestedLogicalOutputs.Count == 0)
+            {
+                return false;
+            }
+
+            if (RouteExists != 3
+                || grantedLogicalOutputs.Count == 0)
+            {
+                // The route has not been established.
+                logger.Info("Route not set within route setting time for " + GuiName);
+                return false;
+            }
+
+            if (!MicaHorizonServer.Instance.SystemSettings.AllowPartialGrant
+                && grantedLogicalOutputs.Count < requestedLogicalOutputs.Count)
+            {
+                // The route has not been established to all of the requested logical outputs.
+                logger.Info("Route not set to all logical outputs within route setting time for " + GuiName);
+                return false; 
+            }
+
+            // Check that the granted logical outputs are ones that were requested.
+            foreach (string grantedLogicalOutput in grantedLogicalOutputs)
+            {
+                if (!requestedLogicalOutputs.Contains(grantedLogicalOutput))
+                {
+                    // At least one of our granted logical outputs was not requested.
+                    logger.Info("Route set to non-requested logical output " + grantedLogicalOutput + " for " + GuiName);
+                    return false;
+                }
+            }
+
+            // The route has been established.
+            return true;
+        }
+
+
+        /// <summary>
+        /// There is time remaining to set the route - check if all logical outputs have been granted.
+        /// Also validate that any granted logical outputs are ones that were requested.
+        /// </summary>
+        /// <returns>True if all logical outputs granted. False if not or no logical outputs requested.</returns>
+        private bool routeSettingTimeAvailableRouteSet()
+        {
+            if (requestedLogicalOutputs.Count == 0)
+            {
+                return false;
+            }
+
+            if (grantedLogicalOutputs.Count == requestedLogicalOutputs.Count)
+            {
+                // Check that the logical outputs are ones that were requested.
+                bool notRequestedLogicalOutputGranted = false;
+
+                foreach (string grantedLogicalOutput in grantedLogicalOutputs)
+                {
+                    if (!requestedLogicalOutputs.Contains(grantedLogicalOutput))
+                    {
+                        // At least one of our granted logical outputs was not requested.
+                        logger.Info("Route set to non-requested logical output " + grantedLogicalOutput + " for " + GuiName);
+                        notRequestedLogicalOutputGranted = true;
+                    }
+                }
+                return !notRequestedLogicalOutputGranted;
+            }
+
+            // The route has not yet been established.
+            return false;
+        }
+        #endregion
+
+        #region switched zones
+        /// <summary>
+        /// The total route setting time has elapsed.
+        /// </summary>
+        /// <returns>True if all switched zones granted or if using partial grant and some 
+        /// switched zones are granted.  Otherwise false.</returns>
+        private bool routeSettingTimeExpiredSwitchedZoneRouteSet()
+        {
+            if (requestedSwitchedZones.Count == 0)
+            {
+                return false;
+            }
+
+            if (grantedSwitchedZones.Count == 0)
+            {
+                logger.Info("Route not set within route setting time for " + GuiName);
+                return false;
+            }
+
+            if (!MicaHorizonServer.Instance.SystemSettings.AllowPartialGrant
+                && grantedSwitchedZones.Count < requestedSwitchedZones.Count)
+            {
+                // The route has not been established to all of the requested zones.
+                logger.Info("Route not set to all switched zones within route setting time for " + GuiName);
+                return false;
+            }
+
+            // The route has been established.
+            return true;
+        }
+
+        /// <summary>
+        /// There is time remaining to set the route - check if all switched zones have been granted.
+        /// </summary>
+        /// <returns>True if all switched zones granted.  False if not or no switched zones requested.</returns>
+        private bool routeSettingTimeAvailableSwitchedZoneRouteSet()
+        {
+            if (requestedSwitchedZones.Count == 0)
+            {
+                return false;
+            }
+
+            return grantedSwitchedZones.Count == requestedSwitchedZones.Count;
+        }
+
+        private void switchedZone_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+        {
+            lock (routeLock)
+            {
+                if (e.PropertyName == "RouteEstablished")
+                {
+                    ServerPaSwitchedZone switchedZone = sender as ServerPaSwitchedZone;
+
+                    if (switchedZone != null
+                        && requestedSwitchedZones.Contains(switchedZone))
+                    {
+                        if (switchedZone.RouteEstablished)
+                        {
+                            // Add it to the list of granted zones.
+                            if (!grantedSwitchedZones.Contains(switchedZone))
+                            {
+                                grantedSwitchedZones.Add(switchedZone);
+                            }
+                        }
+                        else
+                        {
+                            // Route not established - remove from the list of granted zones.
+                            if (grantedSwitchedZones.Contains(switchedZone))
+                            {
+                                grantedSwitchedZones.Remove(switchedZone);
+                            }
+                        }
+                        if (grantedSwitchedZones.Count == 0)
+                        {
+                            updateMicrophoneStatus(grantedLogicalOutputs.Count == 0);
+                        }
+                    }
+                }
+            }
+        }
+        #endregion
+        #endregion
+
+        #region report granted PA zones
+        private string requestedZonesList = "";
+        public string RequestedZonesList
+        {
+            get { return requestedZonesList; }
+            private set
+            {
+                if (requestedZonesList != value)
+                {
+                    requestedZonesList = value;
+                    NotifyPropertyValue("RequestedZonesList", RequestedZonesList);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Update the requested zones list property when the number of requested zones changes.
+        /// </summary>
+        private void reportRequestedZones()
+        {
+            List<string> requestedZonesAssetNames = new List<string>();
+
+            foreach (string requestedLogicalOutput in requestedLogicalOutputs)
+            {
+                ServerPaZone requestedZone = null;
+
+                if (requestedLogicalOutputsToZones.TryGetValue(requestedLogicalOutput, out requestedZone)
+                    && requestedZone != null
+                    && requestedZone.paZoneConfig != null
+                    && !requestedZonesAssetNames.Contains(requestedZone.paZoneConfig.AssetName))
+                {
+                    requestedZonesAssetNames.Add(requestedZone.paZoneConfig.AssetName);
+                }
+            }
+
+            foreach (ServerPaSwitchedZone requestedSwitchedZone  in requestedSwitchedZones)
+            {
+                if (requestedSwitchedZone != null
+                    && !requestedZonesAssetNames.Contains(requestedSwitchedZone.paSwitchedZoneConfig.AssetName))
+                {
+                    requestedZonesAssetNames.Add(requestedSwitchedZone.paSwitchedZoneConfig.AssetName);
+                }
+            }
+
+            if (requestedZonesAssetNames.Count == 0)
+            {
+                RequestedZonesList = "";
+            }
+            else
+            {
+                RequestedZonesList = string.Join(";", requestedZonesAssetNames);
+            }
+        }
+        #endregion
+
+        #region report route
+        /// <summary>
+        /// Log events to report the granted/not granted zones when the announcement ends.
+        /// </summary>
+        private void reportRoutePlayedToZones()
+        {
+            int numberOfZonesRequested = requestedLogicalOutputs.Count + requestedSwitchedZones.Count;
+
+            if (numberOfZonesRequested == 0)
+            {
+                logger.Info("End of live annoucement with no zones requested");
+                return;
+            }
+
+            // Get the logical outputs, if any that have not been granted.
+            List<string> notGrantedLogicalOutputs = new List<string>();
+
+            if (grantedLogicalOutputs.Count < requestedLogicalOutputs.Count)
+            {
+                foreach (string requestedLogicalOutput in requestedLogicalOutputs)
+                {
+                    if (!grantedLogicalOutputs.Contains(requestedLogicalOutput))
+                    {
+                        notGrantedLogicalOutputs.Add(requestedLogicalOutput);
+                    }
+                }
+            }
+
+            // Get the switched PA zones, if any that have not been granted.
+            List<ServerPaSwitchedZone> notGrantedSwitchedZones = new List<ServerPaSwitchedZone>();
+
+            if (grantedSwitchedZones.Count < requestedSwitchedZones.Count)
+            {
+                foreach (ServerPaSwitchedZone requestedSwitchedZone in requestedSwitchedZones)
+                {
+                    if (!grantedSwitchedZones.Contains(requestedSwitchedZone))
+                    {
+                        notGrantedSwitchedZones.Add(requestedSwitchedZone);
+                    }
+                }
+            }
+
+            // Get the requested zone names.
+            string requestedZoneNames = "";
+            string requestedSwitchedZoneNames = "";
+            string allRequestedZoneNames = "";
+            List<string> allRequestedZoneSites = new List<string>();
+
+            if (requestedZones.Count > 0)
+            {
+                requestedZoneNames = string.Join(", ", (requestedZones.Select(o => o.paZoneConfig.GuiName)));
+                allRequestedZoneNames = requestedZoneNames;
+                allRequestedZoneSites.AddRange(requestedZones.Select(o => o.paZoneConfig.Site));
+            }
+
+            if (requestedSwitchedZones.Count > 0)
+            {
+                requestedSwitchedZoneNames = string.Join(",", (requestedSwitchedZones.Select(o => o.paSwitchedZoneConfig.GuiName)));
+
+                if (!string.IsNullOrEmpty(allRequestedZoneNames))
+                {
+                    allRequestedZoneNames += ", ";
+                }
+                allRequestedZoneNames += requestedSwitchedZoneNames;
+                allRequestedZoneSites.AddRange(requestedSwitchedZones.Select(o => o.paSwitchedZoneConfig.Site));
+            }
+
+            // Get the granted zone names.
+            string grantedZoneNames = "";
+            string grantedSwitchedZoneNames = "";
+            string allGrantedZoneNames = "";
+            List<string> allGrantedZonesSites = new List<string>();
+
+            foreach (string grantedLogicalOutput in grantedLogicalOutputs)
+            {
+                ServerPaZone grantedZone = null;
+
+                if (requestedLogicalOutputsToZones.TryGetValue(grantedLogicalOutput, out grantedZone)
+                    && grantedZone != null)
+                {
+                    if (!string.IsNullOrEmpty(grantedZoneNames))
+                    {
+                        grantedZoneNames += ", ";
+                    }
+                    grantedZoneNames += grantedZone.paZoneConfig.GuiName;
+                    allGrantedZonesSites.Add(grantedZone.paZoneConfig.Site);
+                }
+            }
+
+            allGrantedZoneNames = grantedZoneNames;
+
+            if (grantedSwitchedZones.Count > 0)
+            {
+                grantedSwitchedZoneNames = string.Join(",", (grantedSwitchedZones.Select(o => o.paSwitchedZoneConfig.GuiName)));
+
+                if (!string.IsNullOrEmpty(allGrantedZoneNames))
+                {
+                    allGrantedZoneNames += ", ";
+                }
+                allGrantedZoneNames += grantedSwitchedZoneNames;
+                allGrantedZonesSites.AddRange(grantedSwitchedZones.Select(o => o.paSwitchedZoneConfig.Site));
+            }
+
+            // Get the not granted zone names.
+            string notGrantedZoneNames = "";
+            string notGrantedSwitchedZoneNames = "";
+            string allNotGrantedZoneNames = "";
+            List<string> allNotGrantedZonesSites = new List<string>();
+
+            foreach (string notGrantedLogicalOutput in notGrantedLogicalOutputs)
+            {
+                ServerPaZone notGrantedZone = null;
+
+                if (requestedLogicalOutputsToZones.TryGetValue(notGrantedLogicalOutput, out notGrantedZone)
+                    && notGrantedZone != null)
+                {
+                    if (!string.IsNullOrEmpty(notGrantedZoneNames))
+                    {
+                        notGrantedZoneNames += ", ";
+                    }
+                    notGrantedZoneNames += notGrantedZone.paZoneConfig.GuiName;
+                    allNotGrantedZonesSites.Add(notGrantedZone.paZoneConfig.Site);
+                }
+            }
+
+            allNotGrantedZoneNames = notGrantedZoneNames;
+
+            if (notGrantedSwitchedZones.Count > 0)
+            {
+                notGrantedSwitchedZoneNames = string.Join(",", (notGrantedSwitchedZones.Select(o => o.paSwitchedZoneConfig.GuiName)));
+
+                if (!string.IsNullOrEmpty(allNotGrantedZoneNames))
+                {
+                    allNotGrantedZoneNames += ", ";
+                }
+                allNotGrantedZoneNames += notGrantedSwitchedZoneNames;
+                allNotGrantedZonesSites.AddRange(notGrantedSwitchedZones.Select(o => o.paSwitchedZoneConfig.Site));
+            }
+
+            if (grantedLogicalOutputs.Count > 0)
+            {
+                if (notGrantedLogicalOutputs.Count == 0)
+                {
+                    // Played to all requested logical outputs.
+                    logger.Debug("Live announcement - played to all requested logical outputs: " + string.Join(", ", requestedLogicalOutputs));
+                }
+                else
+                {
+                    logger.Debug("Live announcement - played to logical outputs: " + string.Join(", ", grantedLogicalOutputs));
+                }
+            }
+
+            if (notGrantedLogicalOutputs.Count > 0)
+            {
+                logger.Debug("Live announcement - missed logical outputs: " + string.Join(", ", notGrantedLogicalOutputs));
+            }
+
+            if (grantedSwitchedZones.Count > 0)
+            {
+                if (notGrantedSwitchedZones.Count == 0)
+                {
+                    // Played to all requested switched zones.
+                    logger.Debug("Live announcement - played to all requested switched zones: " + requestedSwitchedZoneNames);
+                }
+                else
+                {
+                    logger.Debug("Live announcement - played to switched zones: " + grantedSwitchedZoneNames);
+                }
+            }
+
+            if (notGrantedSwitchedZones.Count > 0)
+            {
+                logger.Debug("Live announcement - missed switched zones: " + notGrantedSwitchedZoneNames);
+            }
+
+            if (MicaHorizonServer.Instance.SystemSettings.AllowPartialGrant)
+            {
+                // Log partial grant specific events.
+                string notGrantedpaZonesSiteIds = string.Empty;
+                string grantedPaZoneSiteIds = string.Empty;
+                string allRequestedZonesSiteIds = string.Empty;
+
+                if (notGrantedLogicalOutputs.Count == 0
+                    && notGrantedSwitchedZones.Count == 0)
+                {
+                    // Played to all requested zones.
+                    logger.Info("Live Announcement played to zones: " + allRequestedZoneNames);
+
+                    allRequestedZonesSiteIds = string.Join(",", allRequestedZoneSites?.Distinct());
+
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement played to zones: ",
+                        allRequestedZoneNames, "", "", "", allRequestedZonesSiteIds);
+
+                }
+                else if (notGrantedLogicalOutputs.Count + notGrantedSwitchedZones.Count >= numberOfZonesRequested)
+                {
+                    // Failed to play to any of the requested zones.
+                    logger.Info("Live Announcement failed to play to all zones: " + allNotGrantedZoneNames);
+
+                    notGrantedpaZonesSiteIds = string.Join(",", allNotGrantedZonesSites?.Distinct());
+
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement failed to play to zones: ",
+                        allNotGrantedZoneNames, "", "", "", notGrantedpaZonesSiteIds);
+                }
+                else
+                {
+                    // Failed to play to some zones.
+                    logger.Info("Live Announcement partially played to zones: " + allGrantedZoneNames);
+                    logger.Info("Live Announcement partially played missed zones: " + allNotGrantedZoneNames);
+
+                    notGrantedpaZonesSiteIds = string.Join(",", allNotGrantedZonesSites?.Distinct());
+                    grantedPaZoneSiteIds = string.Join(",", allGrantedZonesSites?.Distinct());
+
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement partially played to zones: ",
+                        allGrantedZoneNames, "", "", "", grantedPaZoneSiteIds);
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement partially played missed zones: ",
+                        allNotGrantedZoneNames, "", "", "", notGrantedpaZonesSiteIds);
+                }
+            }
+            else
+            {
+                // Log events to report status of request for all zones.
+                if (notGrantedLogicalOutputs.Count > 0
+                    || notGrantedSwitchedZones.Count > 0)
+                {
+                    // Failed to play to any of the requested zones.
+                    logger.Info("Live Announcement failed to play to all zones: " + allNotGrantedZoneNames);
+
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement failed to play to zones: ",
+                        allRequestedZoneNames, "", "", "", string.Join(",", allRequestedZoneSites?.Distinct()));
+                }
+                else
+                {
+                    // Played to all requested zones.
+                    logger.Info("Live Announcement played to zones: " + allRequestedZoneNames);
+                    MicaHorizonServer.LogEvent("Pa", Constants.eEventCause.Internal, "Live Announcement played to zones: ",
+                        allRequestedZoneNames, "", "", "", string.Join(",", allRequestedZoneSites?.Distinct()));
+                }
+            }
+        }
+        #endregion
+    }
+}

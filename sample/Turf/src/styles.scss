@@ -1,0 +1,82 @@
+/* You can add global styles to this file, and also import other style files */
+$mdc-theme-primary: #00A99D; // primary color #006064
+$mdc-theme-secondary: #FE971F; // secondary color
+$mdc-theme-background: #fff; // background color
+
+
+@import "~@angular-mdc/theme/material";
+
+
+.main-app-bar { 
+   margin-bottom: 100px;
+   @include mdc-typography(body2);
+   @include mdc-top-app-bar-fill-color($mdc-theme-primary);
+}
+
+.logincontent--row {
+    width: 100%;
+  @include mdc-typography(body2);
+  
+  color:  #00A99D;
+
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  padding: 10px 0 10px 0;
+
+}
+
+// Card
+.demo-shape-card-container {
+    @include mdc-shape-angled-corner($mdc-theme-background, 24px, 4px);
+    @include mdc-shape-angled-corner-outline($mdc-card-outline-width, $mdc-card-outline-color);
+    width: 100%;
+  }
+  
+  .demo-shape-card {
+    @include mdc-card-corner-radius(24px 4px);
+  
+    @include mdc-rtl {
+      @include mdc-card-corner-radius(4px 24px);
+    }
+  }
+
+  .login-shape-card {
+      width: 50%;
+    @include mdc-card-corner-radius(24px 4px);
+  
+    @include mdc-rtl {
+      @include mdc-card-corner-radius(4px 24px);
+    }
+  }
+  
+  .demo-shape-card--row {
+    display: flex;
+  }
+  
+  .demo-shape-card__media {
+    background-image: url(https://material-components-web.appspot.com/images/1-1.jpg);
+  
+    width: 50%;
+    border-top-left-radius: inherit;
+  
+    @include mdc-rtl {
+      border-top-left-radius: 0;
+      border-top-right-radius: inherit;
+    }
+  }
+  
+  .demo-shape-card__info {
+    display: flex;
+    flex-direction: column;
+    padding: 8px 16px;
+  }
+
+  .demo-content-headline {
+    @include mdc-typography(headline6);
+  }
+
+// End
+  .mdc-text-field__input {
+    @include mdc-typography(body2);
+  }

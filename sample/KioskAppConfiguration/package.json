@@ -1,0 +1,20 @@
+{
+  "name": "mica-kiosk-app",
+  "version": "0.0.0",
+  "chromium-args": "--enable-logging --user-data-dir=.\\mica-kiosk-app --enable-webaudio-input --unsafely-treat-insecure-origin-as-secure=http://10.90.227.85:58001 --enable-webaudio-input --unsafely-treat-insecure-origin-as-secure=http://137.221.19.73:58001",
+  "main": "http://localhost:4200/",
+  "node-remote": "http://localhost:4200/",
+  "window": {
+    "toolbar": false,
+    "title": "MICA4",
+    "resizable": false,
+    "width": 550,
+    "height": 870
+  },
+  "scripts": {
+    "start": "nw ."
+  },
+  "dependencies": {
+  },
+  "devDependencies": {}
+}
