@@ -1,13 +1,13 @@
 ## MicaKioskApp
 
-This is configuration for [MicaWebApp] to run it as kiosk application using [NW.js](http://nwjs.io/).
+This is configuration for turf to run it as kiosk application using [NW.js](http://nwjs.io/).
 
 ## Prerequisites
 
 To run kiosk application:
 
 - NW.js is required. It can be downloaded [here](https://github.com/nwjs/nw.js#downloads).
-- MicaWebApp should be run.
+- turf  should be run using ng serve on port 4200.
 
 ## Usage
 
